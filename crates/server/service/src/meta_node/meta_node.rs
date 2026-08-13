@@ -228,26 +228,20 @@ impl<SP: SpawnApi> MetaNode<SP> {
 
         let socket_addr = Self::resolve_listen_addr(endpoint).await?;
 
-        let config = &meta_node.raft_store.config;
-        let mut tls_listener = None;
-
-        // Read the identity before either listener binds, so a certificate that
-        // cannot be read stops the node instead of leaving it serving plaintext
-        // alone while its peers expect TLS.
-        if let Some(tls_endpoint) = config.raft_tls_listen_host_endpoint() {
-            info!("Start raft TLS service listening on: {}", tls_endpoint);
-
-            let tls = Self::raft_tls_config(config).await?;
-            let tls_socket_addr = Self::resolve_listen_addr(&tls_endpoint).await?;
-
-            tls_listener = Some((tls_socket_addr, tls));
-        }
-
         Self::spawn_raft_listener(&meta_node, socket_addr, None).await?;
 
-        if let Some((tls_socket_addr, tls)) = tls_listener {
-            Self::spawn_raft_listener(&meta_node, tls_socket_addr, Some(tls)).await?;
-        }
+        let config = &meta_node.raft_store.config;
+
+        let Some(tls_endpoint) = config.raft_tls_listen_host_endpoint() else {
+            return Ok(());
+        };
+
+        info!("Start raft TLS service listening on: {}", tls_endpoint);
+
+        let tls = Self::raft_tls_config(config).await?;
+        let tls_socket_addr = Self::resolve_listen_addr(&tls_endpoint).await?;
+
+        Self::spawn_raft_listener(&meta_node, tls_socket_addr, Some(tls)).await?;
 
         Ok(())
     }
