@@ -26,6 +26,7 @@ use std::time::Instant;
 
 use databend_meta_raft_config::config::RaftConfig;
 use databend_meta_types::ConnectionError;
+use databend_meta_types::node::Node;
 use databend_meta_types::protobuf::raft_service_client::RaftServiceClient;
 use log::warn;
 use subtle::Choice;
@@ -106,7 +107,7 @@ impl Interceptor for RaftSecretInterceptor {
 pub type SecretRaftServiceClient =
     RaftServiceClient<InterceptedService<Channel, RaftSecretInterceptor>>;
 
-/// Connect to the raft service at `addr` with a client that sends the secret.
+/// Connect to `peer`'s raft service with a client that sends the secret.
 ///
 /// Every outgoing raft RPC has to come from a client built this way, or from
 /// `RaftClient` for the ones openraft sends. A client built straight from the
@@ -117,12 +118,10 @@ pub type SecretRaftServiceClient =
 /// repository and forwards its own RPCs -- node registration on startup among
 /// them. Those calls need this, not the generated stub.
 pub async fn connect_raft_service(
-    addr: impl fmt::Display,
-    peer_tls_address: Option<&str>,
+    peer: &RaftPeerTarget,
     config: &RaftConfig,
 ) -> Result<SecretRaftServiceClient, ConnectionError> {
-    let peer_tls = PeerTls::resolve(peer_tls_address, config).await?;
-    let channel = connect_raft_channel(addr, peer_tls.as_ref()).await?;
+    let channel = peer.connect().await?;
 
     Ok(RaftServiceClient::with_interceptor(
         channel,
@@ -130,53 +129,84 @@ pub async fn connect_raft_service(
     ))
 }
 
-/// What it takes to reach one peer over TLS: the address that peer published
-/// for its TLS listener, and the settings this node verifies its certificate
-/// with.
+/// Where one peer's raft service is reached, and over which transport.
 ///
-/// The two halves are useless apart, so they are carried together and produced
-/// together by [`PeerTls::resolve`]. Holding them in one value is what keeps
-/// "is this connection encrypted" a single question with a single answer.
-pub(crate) struct PeerTls {
+/// The address and the decision to encrypt are one value because they are one
+/// decision: a peer reached over TLS is reached at the address it published for
+/// its TLS listener, not at its plaintext one. Splitting them lets a connection
+/// be dialed at one address and named by the other, which is how a log line or
+/// the `active_peers` metric comes to report a peer this node is not talking
+/// to.
+#[derive(Clone, Default)]
+pub struct RaftPeerTarget {
+    /// The `host:port` the connection is dialed at.
     address: String,
-    client_config: ClientTlsConfig,
+
+    /// The settings the peer's certificate is verified with. `Some` is what
+    /// makes this connection TLS, and `address` the peer's TLS address.
+    client_config: Option<ClientTlsConfig>,
 }
 
-impl PeerTls {
-    /// Decide whether a peer is reached over TLS, and read what that takes.
+impl fmt::Display for RaftPeerTarget {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}://{}", self.scheme(), self.address)
+    }
+}
+
+impl RaftPeerTarget {
+    /// Where to reach a peer whose record the cluster replicates.
     ///
-    /// The answer is `None` -- dial plaintext -- unless both ends are ready for
-    /// it: this node has a CA to verify the peer against, and `peer_tls_address`
-    /// is what the peer itself published as the address its TLS listener
-    /// answers on. Because the second half is answered per peer, out of data
-    /// the cluster already replicates, the nodes may be upgraded in any order.
-    ///
-    /// A caller that dials an address rather than a known peer -- joining a
-    /// cluster, registering a node -- has no published address to pass, and
-    /// connects in plaintext.
+    /// The transport is TLS only when both ends are ready for it: `node`
+    /// published the address its TLS listener answers on, and this node has a
+    /// CA to verify that peer against. Because the question is answered per
+    /// peer, out of data the cluster already replicates, the nodes may be
+    /// upgraded in any order.
     ///
     /// The CA is read here, on the way to a connection that will use it, rather
     /// than once at startup. That keeps a CA that cannot be read from costing a
     /// node its plaintext peers as well, which during a migration is most of
     /// the cluster.
-    pub(crate) async fn resolve(
-        peer_tls_address: Option<&str>,
-        config: &RaftConfig,
-    ) -> Result<Option<Self>, ConnectionError> {
-        let Some(address) = peer_tls_address else {
-            return Ok(None);
+    pub async fn of_node(node: &Node, config: &RaftConfig) -> Result<Self, ConnectionError> {
+        let Some(tls_address) = &node.raft_tls_advertise_address else {
+            return Ok(Self::plaintext(&node.endpoint));
         };
 
         // A node with no CA has nothing to verify a peer against, so what the
         // peer published is of no use to it.
         let Some(client_config) = Self::client_tls_config(config).await? else {
-            return Ok(None);
+            return Ok(Self::plaintext(&node.endpoint));
         };
 
-        Ok(Some(Self {
-            address: address.to_string(),
-            client_config,
-        }))
+        Ok(Self {
+            address: tls_address.clone(),
+            client_config: Some(client_config),
+        })
+    }
+
+    /// Where to reach an address that belongs to no known peer: joining a
+    /// cluster, registering a node, leaving one.
+    ///
+    /// Such a caller has no peer record to read a published TLS address out of,
+    /// so it dials plaintext.
+    pub fn plaintext(addr: impl fmt::Display) -> Self {
+        Self {
+            address: addr.to_string(),
+            client_config: None,
+        }
+    }
+
+    /// The `host:port` this target is dialed at, which is what a log line, an
+    /// error context or a metric label has to name.
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    fn scheme(&self) -> &'static str {
+        if self.client_config.is_some() {
+            "https"
+        } else {
+            "http"
+        }
     }
 
     /// The settings this node verifies its peers' certificates with, or `None`
@@ -211,61 +241,59 @@ impl PeerTls {
 
         Ok(Some(tls))
     }
-}
 
-/// Open the transport to a peer's raft service, without wrapping it in a
-/// client.
-///
-/// Every outbound raft connection is opened here, so that the address and the
-/// scheme are decided once instead of at each call site. `peer_tls` decides
-/// both: present, the connection goes to the address the peer published, over
-/// TLS; absent, to `addr`, in plaintext.
-///
-/// A TLS connection is never retried in plaintext. Falling back would hand
-/// anyone who can drop a packet the power to turn the encryption off.
-pub(crate) async fn connect_raft_channel(
-    addr: impl fmt::Display,
-    peer_tls: Option<&PeerTls>,
-) -> Result<Channel, ConnectionError> {
-    match peer_tls {
-        Some(peer) => connect_tls(peer).await,
-        None => connect_plaintext(addr).await,
+    /// Open the transport to this peer's raft service, without wrapping it in a
+    /// client.
+    ///
+    /// Every outbound raft connection is opened here, so that the address and
+    /// the scheme are decided once instead of at each call site.
+    ///
+    /// A TLS connection is never retried in plaintext. Falling back would hand
+    /// anyone who can drop a packet the power to turn the encryption off.
+    pub(crate) async fn connect(&self) -> Result<Channel, ConnectionError> {
+        match &self.client_config {
+            Some(client_config) => self.connect_tls(client_config).await,
+            None => self.connect_plaintext().await,
+        }
     }
-}
 
-/// Connect to the address a peer published for its TLS listener.
-///
-/// The scheme and the TLS settings are set together on purpose. tonic reads the
-/// scheme alone to decide whether to hand the connection to the TLS connector,
-/// so `http://` carrying a `ClientTlsConfig` connects in plaintext and reports
-/// nothing.
-async fn connect_tls(peer: &PeerTls) -> Result<Channel, ConnectionError> {
-    let uri = format!("https://{}", peer.address);
+    /// Connect to the address the peer published for its TLS listener.
+    ///
+    /// The scheme and the TLS settings are set together on purpose. tonic reads
+    /// the scheme alone to decide whether to hand the connection to the TLS
+    /// connector, so `http://` carrying a `ClientTlsConfig` connects in
+    /// plaintext and reports nothing.
+    async fn connect_tls(
+        &self,
+        client_config: &ClientTlsConfig,
+    ) -> Result<Channel, ConnectionError> {
+        let uri = self.to_string();
 
-    let endpoint =
-        Channel::from_shared(uri.clone()).map_err(|e| ConnectionError::new(e, uri.clone()))?;
+        let endpoint =
+            Channel::from_shared(uri.clone()).map_err(|e| ConnectionError::new(e, uri.clone()))?;
 
-    let endpoint = endpoint
-        .tls_config(peer.client_config.clone())
-        .map_err(|e| ConnectionError::new(e, uri.clone()))?;
+        let endpoint = endpoint
+            .tls_config(client_config.clone())
+            .map_err(|e| ConnectionError::new(e, uri.clone()))?;
 
-    endpoint
-        .connect()
-        .await
-        .map_err(|e| ConnectionError::new(e, uri))
-}
+        endpoint
+            .connect()
+            .await
+            .map_err(|e| ConnectionError::new(e, uri))
+    }
 
-/// Connect to the address a peer is reached at when TLS is not in play.
-async fn connect_plaintext(addr: impl fmt::Display) -> Result<Channel, ConnectionError> {
-    let uri = format!("http://{}", addr);
+    /// Connect to the address the peer is reached at when TLS is not in play.
+    async fn connect_plaintext(&self) -> Result<Channel, ConnectionError> {
+        let uri = self.to_string();
 
-    let endpoint =
-        Channel::from_shared(uri.clone()).map_err(|e| ConnectionError::new(e, uri.clone()))?;
+        let endpoint =
+            Channel::from_shared(uri.clone()).map_err(|e| ConnectionError::new(e, uri.clone()))?;
 
-    endpoint
-        .connect()
-        .await
-        .map_err(|e| ConnectionError::new(e, uri))
+        endpoint
+            .connect()
+            .await
+            .map_err(|e| ConnectionError::new(e, uri))
+    }
 }
 
 /// What a [`RaftSecretChecker`] made of a request, separate from acting on it.

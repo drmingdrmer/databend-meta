@@ -28,12 +28,10 @@ use databend_meta_runtime_api::SpawnApi;
 use databend_meta_snapshot_db::DB;
 use databend_meta_snapshot_db::Snapshot;
 use databend_meta_types::ConnectionError;
-use databend_meta_types::Endpoint;
 use databend_meta_types::GrpcHelper;
 use databend_meta_types::MetaNetworkError;
 use databend_meta_types::PbAppendRequestExt;
 use databend_meta_types::PbAppendResponseExt;
-use databend_meta_types::node::Node;
 use databend_meta_types::protobuf as pb;
 use databend_meta_types::protobuf::InstallEntryV004;
 use databend_meta_types::protobuf::RaftReply;
@@ -88,8 +86,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::metrics::raft_metrics;
 use crate::raft_client::RaftClient;
 use crate::raft_client::RaftClientApi;
-use crate::raft_secret::PeerTls;
-use crate::raft_secret::connect_raft_channel;
+use crate::raft_secret::RaftPeerTarget;
 use crate::store::RaftStore;
 
 const APPEND_V002_CHANNEL_SIZE: usize = 64;
@@ -199,16 +196,14 @@ pub struct Network<SP> {
     /// The node id to send message to.
     target: NodeId,
 
-    /// The endpoint of the target node.
-    endpoint: Endpoint,
-
-    /// The address the target node published for its raft TLS listener, if it
-    /// published one.
+    /// Where the target node is reached, and over which transport.
     ///
-    /// Read from the target's own record beside [`Self::endpoint`], so it is
-    /// refreshed whenever the address is, and a peer that stops serving TLS
-    /// stops being dialed that way as soon as it says so.
-    peer_tls_address: Option<String>,
+    /// Rebuilt from the target's own record on every reconnect, so a peer that
+    /// starts or stops serving TLS is dialed the new way as soon as it says so.
+    /// Whatever names this connection afterwards -- a log line, an error
+    /// context, the `active_peers` metric -- names the address held here, which
+    /// is the address the connection was dialed at.
+    peer: RaftPeerTarget,
 
     client: Mutex<Option<RaftClient>>,
 
@@ -224,27 +219,23 @@ impl<SP: SpawnApi> Network<SP> {
     #[logcall::logcall(err = "debug")]
     #[fastrace::trace]
     pub async fn new_client(&self) -> Result<RaftClient, ConnectionError> {
-        info!(id = self.id; "Raft NetworkConnection connect: target={}: {}", self.target, self.endpoint);
+        info!(id = self.id; "Raft NetworkConnection connect: target={}: {}", self.target, self.peer);
 
-        let peer_tls = PeerTls::resolve(self.peer_tls_address.as_deref(), &self.sto.config).await?;
-
-        let channel = connect_raft_channel(&self.endpoint, peer_tls.as_ref())
+        let channel = self
+            .peer
+            .connect()
             .log_elapsed_debug(format!(
                 "Raft NetworkConnection new_client: connect target: {}",
                 self.target
             ))
             .await?;
 
-        let client = RaftClientApi::new(
-            self.target,
-            self.endpoint.clone(),
-            channel,
-            &self.sto.config,
-        );
+        let client =
+            RaftClientApi::new(self.target, self.peer.address(), channel, &self.sto.config);
 
         info!(
             "Raft NetworkConnection connected to: target={}: {}",
-            self.target, self.endpoint
+            self.target, self.peer
         );
 
         Ok(client)
@@ -262,8 +253,8 @@ impl<SP: SpawnApi> Network<SP> {
 
         let n = 3;
         for _i in 0..n {
-            let node = self
-                .lookup_target_node()
+            self.peer = self
+                .resolve_target()
                 .log_elapsed_debug(format!(
                     "Raft NetworkConnection take_client lookup_target_address: target: {}",
                     self.target
@@ -280,9 +271,6 @@ impl<SP: SpawnApi> Network<SP> {
                     Unreachable::new(&any_err)
                 })?;
 
-            self.endpoint = node.endpoint;
-            self.peer_tls_address = node.raft_tls_advertise_address;
-
             let res = self.new_client().await;
             match res {
                 Ok(c) => {
@@ -291,7 +279,7 @@ impl<SP: SpawnApi> Network<SP> {
                 Err(e) => {
                     warn!(
                         "Raft NetworkConnection fail to connect: target={}: addr={}: {:?}",
-                        self.target, self.endpoint, e
+                        self.target, self.peer, e
                     );
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
@@ -309,7 +297,7 @@ impl<SP: SpawnApi> Network<SP> {
 
     /// Read the target's own record, which is where both the address to dial
     /// and the transport to dial it over come from.
-    async fn lookup_target_node(&self) -> Result<Node, MetaNetworkError> {
+    async fn resolve_target(&self) -> Result<RaftPeerTarget, MetaNetworkError> {
         debug!(
             "Raft NetworkConnection lookup target address: start: target={}",
             self.target
@@ -322,7 +310,9 @@ impl<SP: SpawnApi> Network<SP> {
             ))
         })?;
 
-        Ok(node)
+        let peer = RaftPeerTarget::of_node(&node, &self.sto.config).await?;
+
+        Ok(peer)
     }
 
     pub(crate) fn report_metrics_snapshot(&self, success: bool) {
@@ -401,13 +391,13 @@ impl<SP: SpawnApi> Network<SP> {
 
     /// Convert gRPC status to `Unreachable`
     fn status_to_unreachable(&self, status: tonic::Status) -> Unreachable {
-        Self::status_to_unreachable_at(self.target, &self.endpoint, status)
+        Self::status_to_unreachable_at(self.target, self.peer.address(), status)
     }
 
     /// Convert gRPC status to `Unreachable` without borrowing `self`.
     fn status_to_unreachable_at(
         target: NodeId,
-        endpoint: &Endpoint,
+        endpoint: &str,
         status: tonic::Status,
     ) -> Unreachable {
         warn!(
@@ -829,7 +819,7 @@ impl<SP: SpawnApi> NetStreamAppend<TypeConfig> for Network<SP> {
                 Some("append_v002_request_stream".into()),
             );
 
-            let endpoint = self.endpoint.clone();
+            let endpoint = self.peer.address().to_string();
             let response_stream = response.into_inner().map(move |resp| match resp {
                 Ok(pb_resp) => Ok(pb_resp.into_stream_result()),
                 Err(status) => Err(RPCError::Unreachable(Self::status_to_unreachable_at(
@@ -1030,8 +1020,7 @@ impl<SP: SpawnApi> RaftNetworkFactory<TypeConfig> for NetworkFactory<SP> {
             target,
             sto: self.sto.clone(),
             backoff: self.backoff.clone(),
-            endpoint: Default::default(),
-            peer_tls_address: Default::default(),
+            peer: Default::default(),
             client: Default::default(),
             _phantom: PhantomData,
         }
