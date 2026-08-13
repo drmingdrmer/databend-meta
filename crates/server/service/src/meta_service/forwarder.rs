@@ -57,18 +57,17 @@ impl<'a, SP: SpawnApi> MetaForwarder<'a, SP> {
     ) -> Result<(Endpoint, SecretRaftServiceClient), MetaNetworkError> {
         debug!("new RaftServiceClient to: {}", target);
 
-        let endpoint = self
-            .sto
-            .get_node_raft_endpoint(target)
-            .await
-            .ok_or_else(|| {
-                MetaNetworkError::GetNodeAddrError(format!(
-                    "Node {} not found in state machine",
-                    target
-                ))
-            })?;
+        let node = self.sto.get_node(target).await.ok_or_else(|| {
+            MetaNetworkError::GetNodeAddrError(format!(
+                "Node {} not found in state machine",
+                target
+            ))
+        })?;
 
-        let client = connect_raft_service(&endpoint, &self.sto.config).await?;
+        let endpoint = node.endpoint;
+        let peer_tls_address = node.raft_tls_advertise_address.as_deref();
+
+        let client = connect_raft_service(&endpoint, peer_tls_address, &self.sto.config).await?;
 
         let max_msg_size = self.sto.config.raft_grpc_max_message_size();
         let client = client

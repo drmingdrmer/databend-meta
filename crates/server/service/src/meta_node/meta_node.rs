@@ -744,7 +744,7 @@ impl<SP: SpawnApi> MetaNode<SP> {
         for addr in addrs {
             info!("leave cluster via {}...", addr);
 
-            let conn_res = connect_raft_service(addr, conf).await;
+            let conn_res = connect_raft_service(addr, None, conf).await;
             let mut raft_client = match conn_res {
                 Ok(c) => c,
                 Err(e) => {

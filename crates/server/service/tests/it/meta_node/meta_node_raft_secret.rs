@@ -337,7 +337,7 @@ async fn test_a_strict_node_accepts_a_registration_from_a_secret_client() -> any
         .raft_api_addr::<TokioRuntime>()
         .await?;
 
-    let mut client = connect_raft_service(&leader_addr, &tc.config.raft_config).await?;
+    let mut client = connect_raft_service(&leader_addr, None, &tc.config.raft_config).await?;
 
     let registered = Node::new(1, Endpoint::new("registering-node", 28104))
         .with_grpc_advertise_address(Some("registering-node:9191".to_string()));

@@ -33,6 +33,7 @@ use databend_meta_types::GrpcHelper;
 use databend_meta_types::MetaNetworkError;
 use databend_meta_types::PbAppendRequestExt;
 use databend_meta_types::PbAppendResponseExt;
+use databend_meta_types::node::Node;
 use databend_meta_types::protobuf as pb;
 use databend_meta_types::protobuf::InstallEntryV004;
 use databend_meta_types::protobuf::RaftReply;
@@ -87,6 +88,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::metrics::raft_metrics;
 use crate::raft_client::RaftClient;
 use crate::raft_client::RaftClientApi;
+use crate::raft_secret::PeerTls;
 use crate::raft_secret::connect_raft_channel;
 use crate::store::RaftStore;
 
@@ -200,6 +202,14 @@ pub struct Network<SP> {
     /// The endpoint of the target node.
     endpoint: Endpoint,
 
+    /// The address the target node published for its raft TLS listener, if it
+    /// published one.
+    ///
+    /// Read from the target's own record beside [`Self::endpoint`], so it is
+    /// refreshed whenever the address is, and a peer that stops serving TLS
+    /// stops being dialed that way as soon as it says so.
+    peer_tls_address: Option<String>,
+
     client: Mutex<Option<RaftClient>>,
 
     sto: RaftStore<SP>,
@@ -216,7 +226,9 @@ impl<SP: SpawnApi> Network<SP> {
     pub async fn new_client(&self) -> Result<RaftClient, ConnectionError> {
         info!(id = self.id; "Raft NetworkConnection connect: target={}: {}", self.target, self.endpoint);
 
-        let channel = connect_raft_channel(&self.endpoint)
+        let peer_tls = PeerTls::resolve(self.peer_tls_address.as_deref(), &self.sto.config).await?;
+
+        let channel = connect_raft_channel(&self.endpoint, peer_tls.as_ref())
             .log_elapsed_debug(format!(
                 "Raft NetworkConnection new_client: connect target: {}",
                 self.target
@@ -250,8 +262,8 @@ impl<SP: SpawnApi> Network<SP> {
 
         let n = 3;
         for _i in 0..n {
-            let endpoint = self
-                .lookup_target_address()
+            let node = self
+                .lookup_target_node()
                 .log_elapsed_debug(format!(
                     "Raft NetworkConnection take_client lookup_target_address: target: {}",
                     self.target
@@ -268,7 +280,8 @@ impl<SP: SpawnApi> Network<SP> {
                     Unreachable::new(&any_err)
                 })?;
 
-            self.endpoint = endpoint;
+            self.endpoint = node.endpoint;
+            self.peer_tls_address = node.raft_tls_advertise_address;
 
             let res = self.new_client().await;
             match res {
@@ -294,24 +307,22 @@ impl<SP: SpawnApi> Network<SP> {
         Err(Unreachable::new(&any_err))
     }
 
-    async fn lookup_target_address(&self) -> Result<Endpoint, MetaNetworkError> {
+    /// Read the target's own record, which is where both the address to dial
+    /// and the transport to dial it over come from.
+    async fn lookup_target_node(&self) -> Result<Node, MetaNetworkError> {
         debug!(
             "Raft NetworkConnection lookup target address: start: target={}",
             self.target
         );
 
-        let endpoint = self
-            .sto
-            .get_node_raft_endpoint(&self.target)
-            .await
-            .ok_or_else(|| {
-                MetaNetworkError::GetNodeAddrError(format!(
-                    "Node {} not found in state machine",
-                    self.target
-                ))
-            })?;
+        let node = self.sto.get_node(&self.target).await.ok_or_else(|| {
+            MetaNetworkError::GetNodeAddrError(format!(
+                "Node {} not found in state machine",
+                self.target
+            ))
+        })?;
 
-        Ok(endpoint)
+        Ok(node)
     }
 
     pub(crate) fn report_metrics_snapshot(&self, success: bool) {
@@ -1020,6 +1031,7 @@ impl<SP: SpawnApi> RaftNetworkFactory<TypeConfig> for NetworkFactory<SP> {
             sto: self.sto.clone(),
             backoff: self.backoff.clone(),
             endpoint: Default::default(),
+            peer_tls_address: Default::default(),
             client: Default::default(),
             _phantom: PhantomData,
         }
