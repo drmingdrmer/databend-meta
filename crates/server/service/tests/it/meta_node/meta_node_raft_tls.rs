@@ -29,6 +29,7 @@ use databend_meta::message::ForwardRequest;
 use databend_meta::message::ForwardRequestBody;
 use databend_meta::message::ForwardResponse;
 use databend_meta::meta_service::MetaNode;
+use databend_meta::raft_secret::RaftPeerTarget;
 use databend_meta::raft_secret::connect_raft_service;
 use databend_meta::util::reply_to_api_result;
 use databend_meta_kvapi::KvApiExt;
@@ -234,11 +235,16 @@ async fn test_both_ports_refuse_a_caller_with_no_secret_alike() -> anyhow::Resul
     Ok(())
 }
 
-/// Which address an outbound connection dials, and over which transport.
+/// Which address an outbound connection dials, over which transport, and under
+/// which name it is reported.
 ///
 /// Every case below passes a real address for the one it must choose and
 /// [`dead_addr()`] for the one it must ignore, so an RPC that works names the
-/// choice on its own rather than leaving both possible.
+/// choice on its own rather than leaving both possible. Each case then asserts
+/// the resolved target itself, because that one value is what a log line, an
+/// error context and the `active_peers` metric all read: a connection reported
+/// under an address other than the one it dialed points monitoring at a peer
+/// this node is not talking to.
 #[test(harness = meta_service_test_harness::<TokioRuntime, _, _>)]
 #[fastrace::trace]
 async fn test_which_address_an_outbound_connection_dials() -> anyhow::Result<()> {
@@ -252,42 +258,68 @@ async fn test_which_address_an_outbound_connection_dials() -> anyhow::Result<()>
         .config
         .raft_config
         .raft_api_addr::<TokioRuntime>()
-        .await?
-        .to_string();
+        .await?;
 
     info!("--- a CA here and a TLS address published there: dials the published address");
     {
-        let dead = dead_addr().to_string();
-        let mut client = connect_raft_service(&dead, Some(&tls_addr(&tc)), &with_ca).await?;
+        let peer = peer_target(dead_addr(), Some(tls_addr(&tc)), &with_ca).await?;
 
-        let reply = client.forward(ping()).await?;
-        let response: ForwardResponse = reply_to_api_result(reply.into_inner())?;
+        assert_eq!(peer.address(), tls_addr(&tc));
+        assert_eq!(peer.to_string(), format!("https://{}", tls_addr(&tc)));
 
-        assert_eq!(response, ForwardResponse::Pong);
+        assert_eq!(ping_over(&peer, &with_ca).await?, ForwardResponse::Pong);
     }
 
     info!("--- no CA here: nothing can verify the peer, so the published address goes unused");
     {
         let dead = dead_addr().to_string();
-        let mut client = connect_raft_service(&plaintext_addr, Some(&dead), &no_ca).await?;
+        let peer = peer_target(plaintext_addr.clone(), Some(dead), &no_ca).await?;
 
-        let reply = client.forward(ping()).await?;
-        let response: ForwardResponse = reply_to_api_result(reply.into_inner())?;
+        assert_eq!(peer.address(), plaintext_addr.to_string());
+        assert_eq!(peer.to_string(), format!("http://{}", plaintext_addr));
 
-        assert_eq!(response, ForwardResponse::Pong);
+        assert_eq!(ping_over(&peer, &no_ca).await?, ForwardResponse::Pong);
     }
 
     info!("--- a CA here but nothing published there: plaintext, as for any pre-TLS peer");
     {
-        let mut client = connect_raft_service(&plaintext_addr, None, &with_ca).await?;
+        let peer = peer_target(plaintext_addr.clone(), None, &with_ca).await?;
 
-        let reply = client.forward(ping()).await?;
-        let response: ForwardResponse = reply_to_api_result(reply.into_inner())?;
+        assert_eq!(peer.address(), plaintext_addr.to_string());
+        assert_eq!(peer.to_string(), format!("http://{}", plaintext_addr));
 
-        assert_eq!(response, ForwardResponse::Pong);
+        assert_eq!(ping_over(&peer, &with_ca).await?, ForwardResponse::Pong);
     }
 
     Ok(())
+}
+
+/// Where a peer that publishes `endpoint` as its plaintext address and
+/// `tls_address` as its TLS one is reached from a node configured by `config`.
+///
+/// Which of the two addresses that is, and over which transport, is decided by
+/// [`RaftPeerTarget::of_node`] out of the peer's record and the local
+/// configuration, which is exactly what these cases are about.
+async fn peer_target(
+    endpoint: Endpoint,
+    tls_address: Option<String>,
+    config: &RaftConfig,
+) -> anyhow::Result<RaftPeerTarget> {
+    let node = Node::new(0, endpoint).with_raft_tls_advertise_address(tls_address);
+    let peer = RaftPeerTarget::of_node(&node, config).await?;
+
+    Ok(peer)
+}
+
+/// Send one raft RPC over a connection to `peer`, the way this node's own raft
+/// traffic reaches it.
+async fn ping_over(peer: &RaftPeerTarget, config: &RaftConfig) -> anyhow::Result<ForwardResponse> {
+    let mut client = connect_raft_service(peer, config).await?;
+
+    let reply = client.forward(ping()).await?;
+    let response = reply_to_api_result(reply.into_inner())?;
+
+    Ok(response)
 }
 
 /// `raft_tls_client_domain_name` decides the name a peer's certificate is
@@ -309,19 +341,17 @@ async fn test_the_configured_domain_name_is_what_a_peer_is_verified_against() ->
     wrongly_named.raft_tls_client_domain_name =
         Some("a-name-the-certificate-does-not-carry".to_string());
 
-    let refused = connect_raft_service(&dead_addr(), Some(&tls_addr(&tc)), &wrongly_named).await;
+    let peer = peer_target(dead_addr(), Some(tls_addr(&tc)), &wrongly_named).await?;
+    let refused = ping_over(&peer, &wrongly_named).await;
     assert!(
         refused.is_err(),
         "a certificate issued for other names was accepted"
     );
 
     info!("--- unset, the peer is verified against the address it was dialed on");
-    let mut client = connect_raft_service(&dead_addr(), Some(&tls_addr(&tc)), &unnamed).await?;
+    let peer = peer_target(dead_addr(), Some(tls_addr(&tc)), &unnamed).await?;
 
-    let reply = client.forward(ping()).await?;
-    let response: ForwardResponse = reply_to_api_result(reply.into_inner())?;
-
-    assert_eq!(response, ForwardResponse::Pong);
+    assert_eq!(ping_over(&peer, &unnamed).await?, ForwardResponse::Pong);
 
     Ok(())
 }
