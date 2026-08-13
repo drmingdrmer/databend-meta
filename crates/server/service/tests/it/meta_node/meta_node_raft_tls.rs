@@ -20,6 +20,7 @@
 //! transport is encrypted, the plaintext port keeps answering, and the shared
 //! secret is checked on both alike.
 
+use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -450,6 +451,66 @@ async fn read_replicated(
 
         sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// A node that cannot start every listener it was configured for starts none
+/// of them, whichever of the two fallible steps is the one that fails.
+///
+/// What makes this worth asserting is that a listener, once spawned, cannot be
+/// called back: its service owns an `Arc<MetaNode>`, so the node outlives the
+/// failed startup with nobody holding a handle to stop it. The freed plaintext
+/// port is the observable proof that no such task was left running.
+#[test(harness = meta_service_test_harness::<TokioRuntime, _, _>)]
+#[fastrace::trace]
+async fn test_a_node_that_cannot_start_its_tls_listener_starts_no_listener() -> anyhow::Result<()> {
+    info!("--- a TLS port already taken by someone else");
+    {
+        let mut tc = tls_node(0);
+
+        let tls_port = tc.config.raft_config.raft_tls_port.unwrap();
+        let occupier = TcpListener::bind(("127.0.0.1", tls_port))?;
+
+        assert_startup_leaves_the_plaintext_port_free(&mut tc).await?;
+
+        drop(occupier);
+    }
+
+    info!("--- a certificate that cannot be read");
+    {
+        let mut tc = tls_node(1);
+        tc.config.raft_config.raft_tls_server_cert = Some("/no/such/certificate.pem".to_string());
+
+        assert_startup_leaves_the_plaintext_port_free(&mut tc).await?;
+    }
+
+    Ok(())
+}
+
+/// Start `tc`, require it to fail, and require its plaintext raft port to be
+/// bindable afterwards.
+async fn assert_startup_leaves_the_plaintext_port_free(
+    tc: &mut MetaSrvTestContext<TokioRuntime>,
+) -> anyhow::Result<()> {
+    let started = MetaNode::<TokioRuntime>::boot(&tc.config).await;
+
+    let Err(e) = started else {
+        // Hand the unexpectedly started node to the test context, so that the
+        // ports it holds are released when the context is dropped.
+        tc.meta_node = started.ok();
+        panic!("startup succeeded while a configured listener could not start");
+    };
+    info!("--- startup failed as it must: {}", e);
+
+    let raft_port = tc.config.raft_config.raft_api_port;
+    let rebound = TcpListener::bind(("127.0.0.1", raft_port));
+
+    assert!(
+        rebound.is_ok(),
+        "the plaintext raft port is still served by a listener nothing can stop: {:?}",
+        rebound.err()
+    );
+
+    Ok(())
 }
 
 /// The reason a refusal gives, without the address it names the caller by.
