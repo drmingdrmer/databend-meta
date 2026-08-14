@@ -27,7 +27,8 @@ use std::time::Instant;
 use databend_meta::message::ForwardRequest;
 use databend_meta::message::ForwardRequestBody;
 use databend_meta::meta_service::MetaNode;
-use databend_meta::raft_secret::connect_raft_service;
+use databend_meta::raft_client::connect_raft_service;
+use databend_meta::raft_transport::RaftPeerTarget;
 use databend_meta_kvapi::KvApiExt;
 use databend_meta_raft_config::Secret;
 use databend_meta_runtime_api::TokioRuntime;
@@ -337,7 +338,8 @@ async fn test_a_strict_node_accepts_a_registration_from_a_secret_client() -> any
         .raft_api_addr::<TokioRuntime>()
         .await?;
 
-    let mut client = connect_raft_service(&leader_addr, None, &tc.config.raft_config).await?;
+    let leader = RaftPeerTarget::plaintext(&leader_addr);
+    let mut client = connect_raft_service(&leader, &tc.config.raft_config).await?;
 
     let registered = Node::new(1, Endpoint::new("registering-node", 28104))
         .with_grpc_advertise_address(Some("registering-node:9191".to_string()));

@@ -20,6 +20,7 @@
 //! transport is encrypted, the plaintext port keeps answering, and the shared
 //! secret is checked on both alike.
 
+use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -28,7 +29,8 @@ use databend_meta::message::ForwardRequest;
 use databend_meta::message::ForwardRequestBody;
 use databend_meta::message::ForwardResponse;
 use databend_meta::meta_service::MetaNode;
-use databend_meta::raft_secret::connect_raft_service;
+use databend_meta::raft_client::connect_raft_service;
+use databend_meta::raft_transport::RaftPeerTarget;
 use databend_meta::util::reply_to_api_result;
 use databend_meta_kvapi::KvApiExt;
 use databend_meta_raft_config::Secret;
@@ -233,11 +235,16 @@ async fn test_both_ports_refuse_a_caller_with_no_secret_alike() -> anyhow::Resul
     Ok(())
 }
 
-/// Which address an outbound connection dials, and over which transport.
+/// Which address an outbound connection dials, over which transport, and under
+/// which name it is reported.
 ///
 /// Every case below passes a real address for the one it must choose and
 /// [`dead_addr()`] for the one it must ignore, so an RPC that works names the
-/// choice on its own rather than leaving both possible.
+/// choice on its own rather than leaving both possible. Each case then asserts
+/// the resolved target itself, because that one value is what a log line, an
+/// error context and the `active_peers` metric all read: a connection reported
+/// under an address other than the one it dialed points monitoring at a peer
+/// this node is not talking to.
 #[test(harness = meta_service_test_harness::<TokioRuntime, _, _>)]
 #[fastrace::trace]
 async fn test_which_address_an_outbound_connection_dials() -> anyhow::Result<()> {
@@ -251,42 +258,68 @@ async fn test_which_address_an_outbound_connection_dials() -> anyhow::Result<()>
         .config
         .raft_config
         .raft_api_addr::<TokioRuntime>()
-        .await?
-        .to_string();
+        .await?;
 
     info!("--- a CA here and a TLS address published there: dials the published address");
     {
-        let dead = dead_addr().to_string();
-        let mut client = connect_raft_service(&dead, Some(&tls_addr(&tc)), &with_ca).await?;
+        let peer = peer_target(dead_addr(), Some(tls_addr(&tc)), &with_ca).await?;
 
-        let reply = client.forward(ping()).await?;
-        let response: ForwardResponse = reply_to_api_result(reply.into_inner())?;
+        assert_eq!(peer.address(), tls_addr(&tc));
+        assert_eq!(peer.to_string(), format!("https://{}", tls_addr(&tc)));
 
-        assert_eq!(response, ForwardResponse::Pong);
+        assert_eq!(ping_over(&peer, &with_ca).await?, ForwardResponse::Pong);
     }
 
     info!("--- no CA here: nothing can verify the peer, so the published address goes unused");
     {
         let dead = dead_addr().to_string();
-        let mut client = connect_raft_service(&plaintext_addr, Some(&dead), &no_ca).await?;
+        let peer = peer_target(plaintext_addr.clone(), Some(dead), &no_ca).await?;
 
-        let reply = client.forward(ping()).await?;
-        let response: ForwardResponse = reply_to_api_result(reply.into_inner())?;
+        assert_eq!(peer.address(), plaintext_addr.to_string());
+        assert_eq!(peer.to_string(), format!("http://{}", plaintext_addr));
 
-        assert_eq!(response, ForwardResponse::Pong);
+        assert_eq!(ping_over(&peer, &no_ca).await?, ForwardResponse::Pong);
     }
 
     info!("--- a CA here but nothing published there: plaintext, as for any pre-TLS peer");
     {
-        let mut client = connect_raft_service(&plaintext_addr, None, &with_ca).await?;
+        let peer = peer_target(plaintext_addr.clone(), None, &with_ca).await?;
 
-        let reply = client.forward(ping()).await?;
-        let response: ForwardResponse = reply_to_api_result(reply.into_inner())?;
+        assert_eq!(peer.address(), plaintext_addr.to_string());
+        assert_eq!(peer.to_string(), format!("http://{}", plaintext_addr));
 
-        assert_eq!(response, ForwardResponse::Pong);
+        assert_eq!(ping_over(&peer, &with_ca).await?, ForwardResponse::Pong);
     }
 
     Ok(())
+}
+
+/// Where a peer that publishes `endpoint` as its plaintext address and
+/// `tls_address` as its TLS one is reached from a node configured by `config`.
+///
+/// Which of the two addresses that is, and over which transport, is decided by
+/// [`RaftPeerTarget::of_node`] out of the peer's record and the local
+/// configuration, which is exactly what these cases are about.
+async fn peer_target(
+    endpoint: Endpoint,
+    tls_address: Option<String>,
+    config: &RaftConfig,
+) -> anyhow::Result<RaftPeerTarget> {
+    let node = Node::new(0, endpoint).with_raft_tls_advertise_address(tls_address);
+    let peer = RaftPeerTarget::of_node(&node, config).await?;
+
+    Ok(peer)
+}
+
+/// Send one raft RPC over a connection to `peer`, the way this node's own raft
+/// traffic reaches it.
+async fn ping_over(peer: &RaftPeerTarget, config: &RaftConfig) -> anyhow::Result<ForwardResponse> {
+    let mut client = connect_raft_service(peer, config).await?;
+
+    let reply = client.forward(ping()).await?;
+    let response = reply_to_api_result(reply.into_inner())?;
+
+    Ok(response)
 }
 
 /// `raft_tls_client_domain_name` decides the name a peer's certificate is
@@ -308,19 +341,17 @@ async fn test_the_configured_domain_name_is_what_a_peer_is_verified_against() ->
     wrongly_named.raft_tls_client_domain_name =
         Some("a-name-the-certificate-does-not-carry".to_string());
 
-    let refused = connect_raft_service(&dead_addr(), Some(&tls_addr(&tc)), &wrongly_named).await;
+    let peer = peer_target(dead_addr(), Some(tls_addr(&tc)), &wrongly_named).await?;
+    let refused = ping_over(&peer, &wrongly_named).await;
     assert!(
         refused.is_err(),
         "a certificate issued for other names was accepted"
     );
 
     info!("--- unset, the peer is verified against the address it was dialed on");
-    let mut client = connect_raft_service(&dead_addr(), Some(&tls_addr(&tc)), &unnamed).await?;
+    let peer = peer_target(dead_addr(), Some(tls_addr(&tc)), &unnamed).await?;
 
-    let reply = client.forward(ping()).await?;
-    let response: ForwardResponse = reply_to_api_result(reply.into_inner())?;
-
-    assert_eq!(response, ForwardResponse::Pong);
+    assert_eq!(ping_over(&peer, &unnamed).await?, ForwardResponse::Pong);
 
     Ok(())
 }
@@ -391,6 +422,55 @@ async fn test_a_tls_cluster_replicates_in_both_directions() -> anyhow::Result<()
     Ok(())
 }
 
+/// A node that joins an existing cluster publishes its TLS address, exactly as
+/// a node that boots a cluster of its own does.
+///
+/// Joining is the only way a production node ever enters a cluster, and it is
+/// the one path that carries the node record over the wire and rebuilds it on
+/// the leader. A record that loses its TLS address there leaves every peer
+/// dialing the joined node in plaintext, with nothing to say the TLS listener
+/// it is running was ever meant to be used.
+#[test(harness = meta_service_test_harness::<TokioRuntime, _, _>)]
+#[fastrace::trace]
+async fn test_a_joining_node_publishes_its_tls_address() -> anyhow::Result<()> {
+    let mut tc0 = tls_node(0);
+    let mut tc1 = tls_node(1);
+
+    let leader_addr = tc0
+        .config
+        .raft_config
+        .raft_api_addr::<TokioRuntime>()
+        .await?;
+
+    tc1.config.raft_config.single = false;
+    tc1.config.raft_config.join = vec![leader_addr.to_string()];
+
+    let leader = MetaNode::<TokioRuntime>::boot(&tc0.config).await?;
+    tc0.meta_node = Some(leader.clone());
+
+    leader
+        .raft
+        .wait(timeout())
+        .state(ServerState::Leader, "leader started")
+        .await?;
+
+    info!("--- the follower joins through the join path, not through add_node()");
+    let follower = MetaNode::<TokioRuntime>::start(&tc1.config).await?;
+    tc1.meta_node = Some(follower.clone());
+
+    let joined = follower.join_cluster(&tc1.config).await?;
+    assert_eq!(Ok(()), joined);
+
+    info!("--- the leader stored the record the follower advertises, TLS address included");
+    let stored = leader.raft_store.get_node(&1).await;
+    assert_eq!(Some(tc1.config.get_node()), stored);
+
+    let published_tls_address = stored.and_then(|node| node.raft_tls_advertise_address);
+    assert_eq!(Some(tls_addr(&tc1)), published_tls_address);
+
+    Ok(())
+}
+
 /// An address nothing listens on.
 ///
 /// Handing it to a connection as the half it must not use turns a working RPC
@@ -450,6 +530,66 @@ async fn read_replicated(
 
         sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// A node that cannot start every listener it was configured for starts none
+/// of them, whichever of the two fallible steps is the one that fails.
+///
+/// What makes this worth asserting is that a listener, once spawned, cannot be
+/// called back: its service owns an `Arc<MetaNode>`, so the node outlives the
+/// failed startup with nobody holding a handle to stop it. The freed plaintext
+/// port is the observable proof that no such task was left running.
+#[test(harness = meta_service_test_harness::<TokioRuntime, _, _>)]
+#[fastrace::trace]
+async fn test_a_node_that_cannot_start_its_tls_listener_starts_no_listener() -> anyhow::Result<()> {
+    info!("--- a TLS port already taken by someone else");
+    {
+        let mut tc = tls_node(0);
+
+        let tls_port = tc.config.raft_config.raft_tls_port.unwrap();
+        let occupier = TcpListener::bind(("127.0.0.1", tls_port))?;
+
+        assert_startup_leaves_the_plaintext_port_free(&mut tc).await?;
+
+        drop(occupier);
+    }
+
+    info!("--- a certificate that cannot be read");
+    {
+        let mut tc = tls_node(1);
+        tc.config.raft_config.raft_tls_server_cert = Some("/no/such/certificate.pem".to_string());
+
+        assert_startup_leaves_the_plaintext_port_free(&mut tc).await?;
+    }
+
+    Ok(())
+}
+
+/// Start `tc`, require it to fail, and require its plaintext raft port to be
+/// bindable afterwards.
+async fn assert_startup_leaves_the_plaintext_port_free(
+    tc: &mut MetaSrvTestContext<TokioRuntime>,
+) -> anyhow::Result<()> {
+    let started = MetaNode::<TokioRuntime>::boot(&tc.config).await;
+
+    let Err(e) = started else {
+        // Hand the unexpectedly started node to the test context, so that the
+        // ports it holds are released when the context is dropped.
+        tc.meta_node = started.ok();
+        panic!("startup succeeded while a configured listener could not start");
+    };
+    info!("--- startup failed as it must: {}", e);
+
+    let raft_port = tc.config.raft_config.raft_api_port;
+    let rebound = TcpListener::bind(("127.0.0.1", raft_port));
+
+    assert!(
+        rebound.is_ok(),
+        "the plaintext raft port is still served by a listener nothing can stop: {:?}",
+        rebound.err()
+    );
+
+    Ok(())
 }
 
 /// The reason a refusal gives, without the address it names the caller by.
