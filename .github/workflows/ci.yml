@@ -16,7 +16,7 @@ concurrency:
 jobs:
   diagnose:
     name: lifecycle-${{ matrix.source }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     strategy:
       fail-fast: false
@@ -37,7 +37,16 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest@0.9.151
-      - run: sudo apt-get update && sudo apt-get install -y mold protobuf-compiler gdb strace
+      - name: Install diagnostic build tools
+        timeout-minutes: 5
+        run: |
+          printf '%s\tpriority:%s\n' \
+            'https://mirrors.edge.kernel.org/ubuntu/' 1 \
+            'https://archive.ubuntu.com/ubuntu/' 2 \
+            'https://security.ubuntu.com/ubuntu/' 3 \
+            | sudo tee /etc/apt/apt-mirrors.txt
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::https::Timeout=15 -o APT::Update::Error-Mode=any update
+          sudo apt-get -o Acquire::Retries=2 -o Acquire::https::Timeout=15 install -y mold protobuf-compiler gdb strace
       - name: Prepare identical dependency versions
         env:
           SOURCE: ${{ matrix.source }}
