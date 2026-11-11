@@ -57,7 +57,7 @@ async fn test_meta_node_boot() -> anyhow::Result<()> {
     let tc = MetaSrvTestContext::<TokioRuntime>::new(0);
     let addr = tc.config.raft_config.raft_api_advertise_host_endpoint();
 
-    let mn = MetaNode::<TokioRuntime>::boot(&tc.config).await?;
+    let mn = tc.boot().await?;
 
     let got = mn.get_node(&0).await;
     assert_eq!(addr, got.unwrap().endpoint);
@@ -72,12 +72,12 @@ async fn test_meta_node_boot_raft_port_in_use() -> anyhow::Result<()> {
     // reports a successful boot while serving no raft traffic at all, and peers
     // trying to join it only see connection errors.
 
-    let tc = MetaSrvTestContext::<TokioRuntime>::new(0);
+    let mut tc = MetaSrvTestContext::<TokioRuntime>::new(0);
     let listen = tc.config.raft_config.raft_api_listen_host_endpoint();
+    let _occupied = tc.reserved_raft_listener()?;
+    tc.release_raft_ports();
 
-    let _occupied = std::net::TcpListener::bind(listen.to_string())?;
-
-    let res = MetaNode::<TokioRuntime>::boot(&tc.config).await;
+    let res = tc.boot().await;
     let Err(err) = res else {
         unreachable!("boot must fail when the raft port is occupied");
     };
@@ -126,7 +126,7 @@ async fn test_meta_node_shutdown_with_incomplete_http2_handshake() -> anyhow::Re
 
     for preface in [b"".as_slice(), b"PRI * HTTP/2.0\r\n".as_slice()] {
         let tc = MetaSrvTestContext::<TokioRuntime>::new(0);
-        let mn = MetaNode::<TokioRuntime>::boot(&tc.config).await?;
+        let mn = tc.boot().await?;
         let weak = Arc::downgrade(&mn);
         let receivers = mn.running_tx.receiver_count();
         let address = tc.config.raft_config.raft_api_listen_host_endpoint();
@@ -167,7 +167,7 @@ async fn test_meta_node_shutdown_with_incomplete_tls_handshake() -> anyhow::Resu
         Some(crate::tests::tls_constants::TEST_SERVER_CERT.to_string());
     tc.config.raft_config.raft_tls_server_key =
         Some(crate::tests::tls_constants::TEST_SERVER_KEY.to_string());
-    let mn = MetaNode::<TokioRuntime>::boot(&tc.config).await?;
+    let mn = tc.boot().await?;
     let weak = Arc::downgrade(&mn);
     let receivers = mn.running_tx.receiver_count();
     let address = tc
@@ -199,7 +199,7 @@ async fn test_meta_node_shutdown_with_incomplete_tls_handshake() -> anyhow::Resu
 #[test(harness = meta_service_test_harness::<TokioRuntime, _, _>)]
 async fn test_meta_node_shutdown_with_live_http2_channel() -> anyhow::Result<()> {
     let mut tc = MetaSrvTestContext::<TokioRuntime>::new(0);
-    let mn = MetaNode::<TokioRuntime>::boot(&tc.config).await?;
+    let mn = tc.boot().await?;
     tc.meta_node = Some(mn.clone());
     let mut client = tc.raft_client().await?;
     client
@@ -230,7 +230,7 @@ async fn test_meta_node_join() -> anyhow::Result<()> {
     let node_id = 2;
     let mut tc2 = MetaSrvTestContext::<TokioRuntime>::new(node_id);
     {
-        let mn2 = MetaNode::<TokioRuntime>::open(&tc2.config.raft_config).await?;
+        let mn2 = tc2.open().await?;
         all.push(mn2);
     }
 
@@ -269,7 +269,7 @@ async fn test_meta_node_join() -> anyhow::Result<()> {
     let node_id = 3;
     let mut tc3 = MetaSrvTestContext::<TokioRuntime>::new(node_id);
     {
-        let mn3 = MetaNode::<TokioRuntime>::open(&tc3.config.raft_config).await?;
+        let mn3 = tc3.open().await?;
         all.push(mn3.clone());
     }
 
@@ -322,10 +322,10 @@ async fn test_meta_node_join() -> anyhow::Result<()> {
 
     sleep(Duration::from_secs(1)).await;
 
-    let mn0 = MetaNode::<TokioRuntime>::open(&tc0.config.raft_config).await?;
-    let mn1 = MetaNode::<TokioRuntime>::open(&tc1.config.raft_config).await?;
-    let mn2 = MetaNode::<TokioRuntime>::open(&tc2.config.raft_config).await?;
-    let mn3 = MetaNode::<TokioRuntime>::open(&tc3.config.raft_config).await?;
+    let mn0 = tc0.open().await?;
+    let mn1 = tc1.open().await?;
+    let mn2 = tc2.open().await?;
+    let mn3 = tc3.open().await?;
 
     let all = [mn0, mn1, mn2, mn3];
 
@@ -358,7 +358,7 @@ async fn test_meta_node_join_as_learner() -> anyhow::Result<()> {
     let node_id = 2;
     let tc2 = MetaSrvTestContext::<TokioRuntime>::new(node_id);
     {
-        let mn2 = MetaNode::<TokioRuntime>::open(&tc2.config.raft_config).await?;
+        let mn2 = tc2.open().await?;
         all.push(mn2);
     }
 
@@ -465,7 +465,7 @@ async fn test_meta_node_join_rejoin() -> anyhow::Result<()> {
     let node_id = 1;
     let tc1 = MetaSrvTestContext::<TokioRuntime>::new(node_id);
 
-    let mn1 = MetaNode::<TokioRuntime>::open(&tc1.config.raft_config).await?;
+    let mn1 = tc1.open().await?;
 
     info!("--- join non-voter 1 to cluster");
 
@@ -502,7 +502,7 @@ async fn test_meta_node_join_rejoin() -> anyhow::Result<()> {
     let node_id = 2;
     let tc2 = MetaSrvTestContext::<TokioRuntime>::new(node_id);
 
-    let mn2 = MetaNode::<TokioRuntime>::open(&tc2.config.raft_config).await?;
+    let mn2 = tc2.open().await?;
 
     info!("--- join node-2 by sending rpc `join` to a non-leader");
     {
@@ -578,14 +578,14 @@ async fn test_meta_node_join_with_state() -> anyhow::Result<()> {
             .to_string(),
     ];
 
-    let n0 = MetaNode::<TokioRuntime>::start(&tc0.config).await?;
+    let n0 = tc0.start().await?;
     // Initial membership log, leader blank log, add node-0 log.
     let mut log_index = 3;
 
     let res = n0.join_cluster(&tc0.config).await?;
     assert_eq!(Err("Did not join: --join is empty".to_string()), res);
 
-    let n1 = MetaNode::<TokioRuntime>::start(&tc1.config).await?;
+    let n1 = tc1.start().await?;
     let res = n1.join_cluster(&tc1.config).await?;
     assert_eq!(Ok(()), res);
 
@@ -598,7 +598,7 @@ async fn test_meta_node_join_with_state() -> anyhow::Result<()> {
 
     info!("--- initialize store for node-2");
     {
-        let n2 = MetaNode::<TokioRuntime>::start(&tc2.config).await?;
+        let n2 = tc2.start().await?;
         n2.stop().await?;
     }
 
@@ -607,7 +607,7 @@ async fn test_meta_node_join_with_state() -> anyhow::Result<()> {
 
     info!("--- Allow to join node-2 with initialized store");
     {
-        let n2 = MetaNode::<TokioRuntime>::start(&tc2.config).await?;
+        let n2 = tc2.start().await?;
         let res = n2.join_cluster(&tc2.config).await?;
         assert_eq!(Ok(()), res);
 
@@ -630,7 +630,7 @@ async fn test_meta_node_join_with_state() -> anyhow::Result<()> {
 
     info!("--- Not allowed to join node-2 with store with membership");
     {
-        let n2 = MetaNode::<TokioRuntime>::start(&tc2.config).await?;
+        let n2 = tc2.start().await?;
         let res = n2.join_cluster(&tc2.config).await?;
         assert_eq!(
             Err("Did not join: node 2 already in cluster".to_string()),
@@ -743,8 +743,8 @@ async fn test_meta_node_leave() -> anyhow::Result<()> {
     let tc0 = &tcs[0];
     let tc2 = &tcs[2];
 
-    let mn0 = MetaNode::<TokioRuntime>::open(&tc0.config.raft_config).await?;
-    let mn2 = MetaNode::<TokioRuntime>::open(&tc2.config.raft_config).await?;
+    let mn0 = tc0.open().await?;
+    let mn2 = tc2.open().await?;
 
     let all = [mn0, mn2];
 
@@ -834,7 +834,7 @@ async fn test_meta_node_restart() -> anyhow::Result<()> {
         tc.config.raft_config.max_applied_log_to_keep = 0;
         let addr = tc.config.raft_config.raft_api_advertise_host_endpoint();
 
-        let mn = MetaNode::<TokioRuntime>::boot(&tc.config).await?;
+        let mn = tc.boot().await?;
 
         tc.meta_node = Some(mn.clone());
 
@@ -895,11 +895,13 @@ async fn test_meta_node_restart() -> anyhow::Result<()> {
     let mn0 = MetaNode::<TokioRuntime>::builder(&config.raft_config)
         .node_id(0)
         .sto(sto0)
+        .raft_service_incoming(tc0.raft_service_incoming()?)
         .build()
         .await?;
     let mn1 = MetaNode::<TokioRuntime>::builder(&config.raft_config)
         .node_id(1)
         .sto(sto1)
+        .raft_service_incoming(tc1.raft_service_incoming()?)
         .build()
         .await?;
 
@@ -978,9 +980,7 @@ async fn test_meta_node_restart_single_node() -> anyhow::Result<()> {
 
     tc.drop_meta_node();
 
-    let raft_conf = &tc.config.raft_config;
-
-    let leader = MetaNode::<TokioRuntime>::open(raft_conf).await?;
+    let leader = tc.open().await?;
 
     log_index += 1;
 

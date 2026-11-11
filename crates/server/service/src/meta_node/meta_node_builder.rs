@@ -23,6 +23,7 @@ use log::info;
 use openraft::Config;
 use tokio::sync::Mutex;
 use tokio::sync::watch;
+use tonic::transport::server::TcpIncoming;
 use watcher::dispatch::Dispatcher;
 
 use crate::meta_node::meta_node::MetaRaft;
@@ -39,6 +40,8 @@ pub struct MetaNodeBuilder<SP> {
     pub(crate) raft_config: Option<Config>,
     pub(crate) sto: Option<RaftStore<SP>>,
     pub(crate) raft_service_endpoint: Option<Endpoint>,
+    pub(crate) raft_service_incoming: Option<TcpIncoming>,
+    pub(crate) raft_tls_incoming: Option<TcpIncoming>,
 }
 
 impl<SP: SpawnApi> MetaNodeBuilder<SP> {
@@ -118,9 +121,29 @@ impl<SP: SpawnApi> MetaNodeBuilder<SP> {
             })?
         };
 
-        raft_listener::start_raft_service(meta_node.clone(), &endpoint).await?;
+        raft_listener::start_raft_service(
+            meta_node.clone(),
+            &endpoint,
+            self.raft_service_incoming.take(),
+            self.raft_tls_incoming.take(),
+        )
+        .await?;
 
         Ok(meta_node)
+    }
+
+    /// Serve a previously bound plaintext listener without releasing its port.
+    #[must_use]
+    pub fn raft_service_incoming(mut self, incoming: TcpIncoming) -> Self {
+        self.raft_service_incoming = Some(incoming);
+        self
+    }
+
+    /// Serve a previously bound TLS listener without releasing its port.
+    #[must_use]
+    pub fn raft_tls_incoming(mut self, incoming: TcpIncoming) -> Self {
+        self.raft_tls_incoming = Some(incoming);
+        self
     }
 
     #[must_use]

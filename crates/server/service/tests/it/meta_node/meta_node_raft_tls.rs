@@ -117,7 +117,11 @@ async fn tls_raft_client(addr: &str) -> anyhow::Result<RaftServiceClient<Channel
 /// may turn a plaintext caller away at either of them, and which one it is is
 /// not what these tests are about.
 async fn plaintext_ping(addr: &str) -> anyhow::Result<ForwardResponse> {
-    let mut client = RaftServiceClient::connect(format!("http://{}", addr)).await?;
+    let channel = Channel::from_shared(format!("http://{}", addr))?
+        .connect_timeout(Duration::from_secs(1))
+        .connect()
+        .await?;
+    let mut client = RaftServiceClient::new(channel);
 
     let reply = client.forward(ping()).await?;
     let response = reply_to_api_result(reply.into_inner())?;
@@ -204,7 +208,7 @@ async fn test_both_ports_refuse_a_caller_with_no_secret_alike() -> anyhow::Resul
     // `start_metasrv_with_context()` probes the raft port with a client that
     // sends no secret, which is what this node refuses, so it is booted here
     // instead.
-    let mn = MetaNode::<TokioRuntime>::boot(&tc.config).await?;
+    let mn = tc.boot().await?;
     tc.meta_node = Some(mn.clone());
 
     mn.raft
@@ -374,7 +378,7 @@ async fn test_a_tls_cluster_replicates_in_both_directions() -> anyhow::Result<()
     tc0.config.raft_config = with_root_ca(&tc0.config.raft_config);
     tc1.config.raft_config = with_root_ca(&tc1.config.raft_config);
 
-    let leader = MetaNode::<TokioRuntime>::boot(&tc0.config).await?;
+    let leader = tc0.boot().await?;
     tc0.meta_node = Some(leader.clone());
 
     leader
@@ -392,7 +396,7 @@ async fn test_a_tls_cluster_replicates_in_both_directions() -> anyhow::Result<()
     write_res.await?;
 
     info!("--- the follower joins, publishing a TLS address and no reachable plaintext one");
-    let follower = MetaNode::<TokioRuntime>::open(&tc1.config.raft_config).await?;
+    let follower = tc1.open().await?;
     tc1.meta_node = Some(follower.clone());
 
     leader.add_node(1, reachable_only_over_tls(&tc1)).await?;
@@ -435,7 +439,7 @@ async fn test_a_mixed_tls_cluster_replicates_and_installs_snapshot() -> anyhow::
     tc0.config.raft_config.max_applied_log_to_keep = 0;
     tc0.config.raft_config.install_snapshot_timeout = REPLICATION_TIMEOUT.as_millis() as u64;
 
-    let leader = MetaNode::<TokioRuntime>::boot(&tc0.config).await?;
+    let leader = tc0.boot().await?;
     tc0.meta_node = Some(leader.clone());
 
     leader
@@ -577,7 +581,7 @@ async fn test_a_joining_node_publishes_its_tls_address() -> anyhow::Result<()> {
     tc1.config.raft_config.single = false;
     tc1.config.raft_config.join = vec![leader_addr.to_string()];
 
-    let leader = MetaNode::<TokioRuntime>::boot(&tc0.config).await?;
+    let leader = tc0.boot().await?;
     tc0.meta_node = Some(leader.clone());
 
     leader
@@ -587,7 +591,7 @@ async fn test_a_joining_node_publishes_its_tls_address() -> anyhow::Result<()> {
         .await?;
 
     info!("--- the follower joins through the join path, not through add_node()");
-    let follower = MetaNode::<TokioRuntime>::start(&tc1.config).await?;
+    let follower = tc1.start().await?;
     tc1.meta_node = Some(follower.clone());
 
     let joined = follower.join_cluster(&tc1.config).await?;
@@ -624,7 +628,7 @@ fn with_root_ca(config: &RaftConfig) -> RaftConfig {
 async fn open_node(
     tc: &mut MetaSrvTestContext<TokioRuntime>,
 ) -> anyhow::Result<Arc<MetaNode<TokioRuntime>>> {
-    let node = MetaNode::<TokioRuntime>::open(&tc.config.raft_config).await?;
+    let node = tc.open().await?;
     tc.meta_node = Some(node.clone());
     Ok(node)
 }
@@ -705,8 +709,7 @@ async fn test_a_node_that_cannot_start_its_tls_listener_starts_no_listener() -> 
     {
         let mut tc = tls_node(0);
 
-        let tls_port = tc.config.raft_config.raft_tls_port.unwrap();
-        let occupier = TcpListener::bind(("127.0.0.1", tls_port))?;
+        let occupier = tc.reserved_tls_listener()?;
 
         assert_startup_leaves_the_plaintext_port_free(&mut tc).await?;
 
@@ -729,7 +732,8 @@ async fn test_a_node_that_cannot_start_its_tls_listener_starts_no_listener() -> 
 async fn assert_startup_leaves_the_plaintext_port_free(
     tc: &mut MetaSrvTestContext<TokioRuntime>,
 ) -> anyhow::Result<()> {
-    let started = MetaNode::<TokioRuntime>::boot(&tc.config).await;
+    tc.release_raft_ports();
+    let started = tc.boot().await;
 
     let Err(e) = started else {
         // Hand the unexpectedly started node to the test context, so that the

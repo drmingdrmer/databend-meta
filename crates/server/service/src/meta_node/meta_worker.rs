@@ -46,6 +46,23 @@ impl<RT: RuntimeApi> MetaWorker<RT> {
         config: MetaServiceConfig,
         runtime: Arc<RT>,
     ) -> Result<MetaHandle<RT>, MetaStartupError> {
+        Self::create_meta_worker_with(config, runtime, |config| async move {
+            MetaNode::<RT>::start(&config).await
+        })
+        .await
+    }
+
+    /// Start the node on its owning runtime using a caller-supplied constructor.
+    /// This also permits transferring already reserved listeners into the node.
+    pub async fn create_meta_worker_with<F, Fut>(
+        config: MetaServiceConfig,
+        runtime: Arc<RT>,
+        start: F,
+    ) -> Result<MetaHandle<RT>, MetaStartupError>
+    where
+        F: FnOnce(MetaServiceConfig) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Arc<MetaNode<RT>>, MetaStartupError>> + Send + 'static,
+    {
         config.validate()?;
 
         let rt_for_handle = runtime.clone();
@@ -57,7 +74,7 @@ impl<RT: RuntimeApi> MetaWorker<RT> {
             async move {
                 let (handle_tx, worker_rx) = mpsc::channel(1024);
 
-                let res = MetaNode::<RT>::start(&config).await;
+                let res = start(config).await;
                 let meta_node = match res {
                     Ok(x) => x,
                     Err(e) => {

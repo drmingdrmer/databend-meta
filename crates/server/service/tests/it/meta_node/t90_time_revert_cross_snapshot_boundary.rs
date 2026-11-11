@@ -14,7 +14,6 @@
 
 use std::time::Duration;
 
-use databend_meta::meta_service::MetaNode;
 use databend_meta_kvapi::KvApiExt;
 use databend_meta_runtime_api::TokioRuntime;
 use databend_meta_types::Cmd;
@@ -116,7 +115,7 @@ async fn write_two_logs(
 
         sleep(Duration::from_secs(2)).await;
 
-        meta_node = MetaNode::<TokioRuntime>::open(&tc0.config.raft_config).await?;
+        meta_node = tc0.open().await?;
     }
 
     // Apply second log

@@ -21,13 +21,19 @@ use databend_meta::api::GrpcServer;
 use databend_meta::configs;
 use databend_meta::message::ForwardRequest;
 use databend_meta::message::ForwardRequestBody;
+use databend_meta::meta_node::meta_handle::MetaHandle;
 use databend_meta::meta_node::meta_worker::MetaWorker;
 use databend_meta::meta_service::MetaNode;
+use databend_meta::store::RaftStore;
+use databend_meta_raft_config::MetaStartupError;
+use databend_meta_raft_config::config::RaftConfig;
 use databend_meta_runtime_api::RuntimeApi;
 use databend_meta_types::protobuf::raft_service_client::RaftServiceClient;
 use databend_meta_types::raft_types::NodeId;
 use log::info;
 use tonic::transport::server::TcpIncoming;
+
+use crate::port_reservation::PortReservation;
 
 /// Start one random service and get the session manager.
 #[fastrace::trace]
@@ -58,7 +64,7 @@ pub async fn start_metasrv_with_context<R: RuntimeApi>(
 
     // Now create MetaWorker with the correct config (including the actual port)
     let runtime = R::new_testing("meta-io-rt-ut");
-    let mh = MetaWorker::create_meta_worker(tc.config.clone(), Arc::new(runtime)).await?;
+    let mh = tc.create_meta_worker(Arc::new(runtime)).await?;
     let mh = Arc::new(mh);
 
     // Join cluster if needed (for nodes joining an existing cluster)
@@ -119,6 +125,11 @@ pub struct MetaSrvTestContext<R: RuntimeApi> {
     pub meta_node: Option<Arc<MetaNode<R>>>,
 
     pub grpc_srv: Option<Box<GrpcServer<R>>>,
+
+    // Keep port ownership across restart gaps. These sockets do not listen
+    // until the corresponding server is started.
+    raft_port: Option<PortReservation>,
+    raft_tls_port: Option<PortReservation>,
 }
 
 impl<R: RuntimeApi> MetaSrvTestContext<R> {
@@ -136,12 +147,10 @@ impl<R: RuntimeApi> MetaSrvTestContext<R> {
         // By default, create a meta node instead of open an existent one.
         config.raft_config.single = true;
 
-        config.raft_config.raft_api_port = next_port();
-
-        // Reserved unconditionally, the same way the raft port is: the TLS
-        // listener also needs a certificate and a key, so a test that sets
-        // neither does not open this port and only pays for the reservation.
-        config.raft_config.raft_tls_port = Some(next_port());
+        let raft_port = PortReservation::new().unwrap();
+        let raft_tls_port = PortReservation::new().unwrap();
+        config.raft_config.raft_api_port = raft_port.port();
+        config.raft_config.raft_tls_port = Some(raft_tls_port.port());
 
         // when running unit tests, set raft_listen_host to "127.0.0.1" and raft_advertise_host to localhost,
         // so if something wrong in raft meta nodes communication we will catch bug in unit tests.
@@ -167,7 +176,103 @@ impl<R: RuntimeApi> MetaSrvTestContext<R> {
             meta_node: None,
             grpc_srv: None,
             _temp_dir: temp_dir,
+            raft_port: Some(raft_port),
+            raft_tls_port: Some(raft_tls_port),
         }
+    }
+
+    /// Open a node while transferring clones of the reserved listening sockets.
+    pub async fn open(&self) -> Result<Arc<MetaNode<R>>, MetaStartupError> {
+        let (plaintext, tls) = self
+            .raft_incoming()
+            .map_err(|e| MetaStartupError::InvalidConfig(e.to_string()))?;
+        open_reserved::<R>(&self.config.raft_config, plaintext, tls).await
+    }
+
+    pub async fn boot(&self) -> Result<Arc<MetaNode<R>>, MetaStartupError> {
+        let mn = self.open().await?;
+        mn.init_cluster(self.config.get_node()).await?;
+        Ok(mn)
+    }
+
+    pub async fn start(&self) -> Result<Arc<MetaNode<R>>, MetaStartupError> {
+        if self.config.raft_config.single {
+            self.boot().await
+        } else {
+            self.open().await
+        }
+    }
+
+    /// Transfer reserved listeners to the runtime that owns the worker.
+    pub async fn create_meta_worker(
+        &self,
+        runtime: Arc<R>,
+    ) -> Result<MetaHandle<R>, MetaStartupError> {
+        let (plaintext, tls) = self
+            .raft_incoming()
+            .map_err(|e| MetaStartupError::InvalidConfig(e.to_string()))?;
+        MetaWorker::create_meta_worker_with(
+            self.config.clone(),
+            runtime,
+            move |config| async move {
+                let mn = open_reserved::<R>(&config.raft_config, plaintext, tls).await?;
+                if config.raft_config.single {
+                    mn.init_cluster(config.get_node()).await?;
+                }
+                Ok(mn)
+            },
+        )
+        .await
+    }
+
+    /// Release fixture reservations before deliberately testing normal bind failures.
+    pub fn release_raft_ports(&mut self) {
+        self.raft_port.take();
+        self.raft_tls_port.take();
+    }
+
+    /// Clone the same bound socket, including for deliberate bind-failure tests.
+    pub fn reserved_raft_listener(&self) -> std::io::Result<std::net::TcpListener> {
+        self.raft_port
+            .as_ref()
+            .expect("raft reservation was released")
+            .listener()
+    }
+
+    pub fn raft_service_incoming(&self) -> std::io::Result<TcpIncoming> {
+        tokio::net::TcpListener::from_std(self.reserved_raft_listener()?).map(TcpIncoming::from)
+    }
+
+    /// Obtain a listener clone, e.g. to deliberately occupy the TLS port.
+    pub fn reserved_tls_listener(&self) -> std::io::Result<std::net::TcpListener> {
+        self.raft_tls_port
+            .as_ref()
+            .expect("TLS reservation was released")
+            .listener()
+    }
+
+    fn raft_incoming(
+        &self,
+    ) -> std::io::Result<(Option<std::net::TcpListener>, Option<std::net::TcpListener>)> {
+        let plaintext = self
+            .raft_port
+            .as_ref()
+            .map(|port| port.listener())
+            .transpose()?;
+        let tls = if self
+            .config
+            .raft_config
+            .raft_tls_listen_host_endpoint()
+            .is_some()
+        {
+            self.raft_tls_port
+                .as_ref()
+                .map(|port| port.listener())
+                .transpose()?
+        } else {
+            None
+        };
+        Ok((plaintext, tls))
     }
 
     pub fn meta_node(&self) -> Arc<MetaNode<R>> {
@@ -223,4 +328,28 @@ impl<R: RuntimeApi> MetaSrvTestContext<R> {
         self.meta_node.take();
         self.grpc_srv.take();
     }
+}
+
+async fn open_reserved<R: RuntimeApi>(
+    config: &RaftConfig,
+    plaintext: Option<std::net::TcpListener>,
+    tls: Option<std::net::TcpListener>,
+) -> Result<Arc<MetaNode<R>>, MetaStartupError> {
+    let store = RaftStore::open(config).await?;
+    let mut builder = MetaNode::builder(config)
+        .node_id(store.id)
+        .sto(store)
+        .raft_service_endpoint(config.raft_api_listen_host_endpoint());
+    let incoming = |listener| {
+        tokio::net::TcpListener::from_std(listener)
+            .map(TcpIncoming::from)
+            .map_err(|e| MetaStartupError::InvalidConfig(e.to_string()))
+    };
+    if let Some(listener) = plaintext {
+        builder = builder.raft_service_incoming(incoming(listener)?);
+    }
+    if let Some(listener) = tls {
+        builder = builder.raft_tls_incoming(incoming(listener)?);
+    }
+    builder.build().await
 }

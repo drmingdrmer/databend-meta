@@ -17,7 +17,6 @@
 use std::fs;
 use std::io::Read;
 
-use databend_meta::meta_service::MetaNode;
 use databend_meta_runtime_api::TokioRuntime;
 use databend_meta_snapshot_store::MetaSnapshotId;
 use databend_meta_snapshot_store::SnapshotStore;
@@ -67,7 +66,7 @@ async fn test_meta_node_snapshot_replication() -> anyhow::Result<()> {
     tc.config.raft_config.install_snapshot_timeout = 10_1000; // milli seconds. In a CI multi-threads test delays async task badly.
     tc.config.raft_config.max_applied_log_to_keep = 0;
 
-    let mn = MetaNode::<TokioRuntime>::boot(&tc.config).await?;
+    let mn = tc.boot().await?;
 
     tc.assert_raft_server_connection().await?;
 

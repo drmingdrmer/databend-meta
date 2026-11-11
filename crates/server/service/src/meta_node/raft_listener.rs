@@ -66,6 +66,8 @@ struct RaftListener {
 pub(crate) async fn start_raft_service<SP: SpawnApi>(
     meta_node: Arc<MetaNode<SP>>,
     endpoint: &Endpoint,
+    plaintext_incoming: Option<TcpIncoming>,
+    tls_incoming: Option<TcpIncoming>,
 ) -> Result<(), MetaNetworkError> {
     info!("Start raft service listening on: {}", endpoint);
 
@@ -83,7 +85,8 @@ pub(crate) async fn start_raft_service<SP: SpawnApi>(
     // this function returns an error, with nobody left holding a handle to
     // stop it. Building first leaves a failure with nothing but bound
     // sockets to drop.
-    let plaintext_listener = build_raft_listener(&meta_node, socket_addr, None)?;
+    let plaintext_listener =
+        build_raft_listener(&meta_node, socket_addr, None, plaintext_incoming)?;
 
     let config = &meta_node.raft_store.config;
 
@@ -93,11 +96,19 @@ pub(crate) async fn start_raft_service<SP: SpawnApi>(
 
             let tls = server_tls_config(config).await?;
             let tls_socket_addr = resolve_listen_addr::<SP>(&tls_endpoint).await?;
-            let listener = build_raft_listener(&meta_node, tls_socket_addr, Some(tls))?;
+            let listener =
+                build_raft_listener(&meta_node, tls_socket_addr, Some(tls), tls_incoming)?;
 
             Some(listener)
         }
-        None => None,
+        None => {
+            if tls_incoming.is_some() {
+                return Err(MetaNetworkError::BadAddressFormat(AnyError::error(
+                    "TLS listener supplied without TLS configuration",
+                )));
+            }
+            None
+        }
     };
 
     spawn_raft_listener(&meta_node, plaintext_listener).await;
@@ -133,6 +144,7 @@ fn build_raft_listener<SP: SpawnApi>(
     meta_node: &Arc<MetaNode<SP>>,
     socket_addr: SocketAddr,
     tls: Option<ServerTlsConfig>,
+    incoming: Option<TcpIncoming>,
 ) -> Result<RaftListener, MetaNetworkError> {
     // One service instance per listener: `RaftServiceImpl` is not `Clone`,
     // and creating a second one costs nothing but another handle.
@@ -156,7 +168,18 @@ fn build_raft_listener<SP: SpawnApi>(
     // task, where the error is only observed when the task is joined at
     // shutdown. Until then the node reports a successful start while having
     // no raft service at all.
-    let incoming = TcpIncoming::bind(socket_addr)
+    let incoming = incoming
+        .map(Ok)
+        .unwrap_or_else(|| TcpIncoming::bind(socket_addr))
+        .and_then(|incoming| {
+            if socket_addr.port() != 0 && incoming.local_addr()? != socket_addr {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "prebound raft listener does not match its configured address",
+                ));
+            }
+            Ok(incoming)
+        })
         .map_err(|e| {
             MetaNetworkError::BadAddressFormat(
                 AnyError::new(&e).add_context(|| format!("bind raft service to {}", socket_addr)),
