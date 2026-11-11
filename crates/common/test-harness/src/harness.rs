@@ -32,9 +32,15 @@ where
         .unwrap();
     let root = Span::root(closure_name::<F>(), SpanContext::random());
     let test = test().in_span(root);
-    rt.block_on(test).unwrap();
+    let res = rt.block_on(test);
+    eprintln!("LIFECYCLE HARNESS BODY RESULT: {res:?}");
+    res.unwrap();
 
+    eprintln!("LIFECYCLE HARNESS FLUSH BEGIN");
     shutdown_test();
+    eprintln!("LIFECYCLE HARNESS FLUSH END; RUNTIME DROP BEGIN");
+    drop(rt);
+    eprintln!("LIFECYCLE HARNESS RUNTIME DROP END");
 }
 
 #[allow(dead_code)]
