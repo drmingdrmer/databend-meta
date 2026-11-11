@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
 
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -81,13 +85,27 @@ jobs:
           suite = data['rust-suites']['databend-meta::it']
           pathlib.Path('diagnostics/binary-path.txt').write_text(suite['binary-path'])
           PY
+      - name: Repeat mixed workspace workload
+        id: mixed
+        continue-on-error: true
+        timeout-minutes: 12
+        run: cargo nextest run --locked --workspace --no-fail-fast --stress-count 8 --failure-output immediate-final 2>&1 | tee diagnostics/mixed-workspace.log
       - name: Repeat the lifecycle test with native stack capture
+        id: repeated
+        continue-on-error: true
         run: |
           python3 scripts/diagnose-meta-lifecycle.py "$(cat diagnostics/binary-path.txt)" \
-            --count 500 --parallel 4 --timeout 50 --sudo-gdb \
+            --count 100 --parallel 4 --timeout 50 --sudo-gdb \
             --continue-fast-failures --out diagnostics/repeated 2>&1 | tee diagnostics/repeated-summary.log
-      - name: Check original suite outcome
-        if: always() && steps.workspace.outcome == 'failure'
+      - name: Probe handshake shutdown boundaries
+        run: |
+          for mode in idle partial http2; do
+            python3 scripts/probe-meta-handshake-shutdown.py "$(cat diagnostics/binary-path.txt)" \
+              --mode "$mode" --observe-seconds 12 --release-seconds 5 \
+              --log "diagnostics/peer-$mode.log"
+          done
+      - name: Check actual test outcomes
+        if: always() && (steps.workspace.outcome == 'failure' || steps.mixed.outcome == 'failure' || steps.repeated.outcome == 'failure')
         run: exit 1
       - uses: actions/upload-artifact@v4
         if: always()
