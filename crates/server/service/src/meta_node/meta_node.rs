@@ -241,7 +241,9 @@ impl<SP: SpawnApi> MetaNode<SP> {
     pub async fn stop(&self) -> Result<i32, MetaError> {
         let mut rx = self.raft.metrics();
 
+        eprintln!("STOP {} raft.shutdown BEGIN", self.raft_store.id);
         let res = self.raft.shutdown().await;
+        eprintln!("STOP {} raft.shutdown END: {res:?}", self.raft_store.id);
         info!("raft shutdown res: {:?}", res);
 
         // The returned error does not mean this function call failed.
@@ -252,6 +254,10 @@ impl<SP: SpawnApi> MetaNode<SP> {
 
         // safe unwrap: receiver wait for change.
         self.running_tx.send(()).unwrap();
+        eprintln!(
+            "STOP {} signal SENT; metrics close BEGIN",
+            self.raft_store.id
+        );
 
         // wait for raft to close the metrics tx
         loop {
@@ -265,9 +271,15 @@ impl<SP: SpawnApi> MetaNode<SP> {
             );
         }
         info!("shutdown raft");
+        eprintln!(
+            "STOP {} metrics close END; join lock BEGIN",
+            self.raft_store.id
+        );
 
-        for j in self.join_handles.lock().await.iter_mut() {
+        for (i, j) in self.join_handles.lock().await.iter_mut().enumerate() {
+            eprintln!("STOP {} join {i} BEGIN", self.raft_store.id);
             let res = j.await;
+            eprintln!("STOP {} join {i} END: {res:?}", self.raft_store.id);
             info!("task quit res: {:?}", res);
 
             // The returned error does not mean this function call failed.

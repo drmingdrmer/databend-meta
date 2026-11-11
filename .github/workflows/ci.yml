@@ -1,71 +1,88 @@
-name: CI
+name: Diagnose Meta lifecycle
 
 on:
   push:
-  pull_request:
+    branches:
+      - diagnose/meta-lifecycle-hang
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  lint:
+  diagnose:
+    name: lifecycle-${{ matrix.source }}
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        source: [head, parent]
+    env:
+      CARGO_INCREMENTAL: 0
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@nightly
         with:
-          components: rustfmt, clippy
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2025-12-11
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: |
-            .
-            crates/tests/raft-protocol-compat/bin-current
-            crates/tests/raft-protocol-compat/bin-v1.2.873
-            crates/tests/raft-protocol-compat/bin-v260205.4.0
-      - run: sudo apt-get update && sudo apt-get install -y mold protobuf-compiler
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: make raft-protocol-compat-lint
-      - run: cargo install taplo-cli --locked
-      - run: taplo fmt --check
-      - run: cargo doc --workspace --no-deps
+          key: lifecycle-${{ matrix.source }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.151
+      - run: sudo apt-get update && sudo apt-get install -y mold protobuf-compiler gdb strace
+      - name: Prepare identical dependency versions
         env:
-          RUSTDOCFLAGS: -D warnings
-
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
-      - run: sudo apt-get update && sudo apt-get install -y mold protobuf-compiler
-      - run: cargo nextest run --no-fail-fast --workspace
-
-  raft-protocol-compat:
-    # Cross-version raft protocol & on-disk format compatibility. Builds
-    # bin-current (working tree) plus every pinned bin-v<TAG> workspace and
-    # runs the orchestrator against the full matrix. See
-    # crates/tests/raft-protocol-compat/README.md.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
+          SOURCE: ${{ matrix.source }}
+        run: |
+          mkdir -p diagnostics
+          if [ "$SOURCE" = parent ]; then
+            git diff 78cc768358d55ab08cab9c45f3feb8117fd6463e^ 78cc768358d55ab08cab9c45f3feb8117fd6463e --binary | git apply --reverse
+          fi
+          cp scripts/meta-lifecycle-Cargo.lock Cargo.lock
+          cargo metadata --format-version 1 > /dev/null
+          python3 - <<'PY'
+          import pathlib, tomllib
+          def packages(path):
+              return {(p['name'], p['version'], p.get('source'), p.get('checksum'))
+                      for p in tomllib.loads(pathlib.Path(path).read_text())['package']}
+          expected = packages('scripts/meta-lifecycle-Cargo.lock')
+          actual = packages('Cargo.lock')
+          assert actual == expected, (actual - expected, expected - actual)
+          PY
+          cp Cargo.lock diagnostics/resolved-Cargo.lock
+          { rustc -Vv; cargo -V; cargo nextest --version; uname -a; nproc; git diff --stat; } | tee diagnostics/environment.log
+      - name: Reproduce original workspace workload
+        id: workspace
+        continue-on-error: true
+        run: cargo nextest run --locked --workspace --no-fail-fast --failure-output immediate-final 2>&1 | tee diagnostics/workspace.log
+      - name: Resolve the exact workspace test binary
+        run: |
+          cargo nextest list --locked --workspace --message-format json > diagnostics/nextest-list.json
+          python3 - <<'PY'
+          import json, pathlib
+          data = json.loads(pathlib.Path('diagnostics/nextest-list.json').read_text())
+          suite = data['rust-suites']['databend-meta::it']
+          pathlib.Path('diagnostics/binary-path.txt').write_text(suite['binary-path'])
+          PY
+      - name: Repeat the lifecycle test with native stack capture
+        run: |
+          python3 scripts/diagnose-meta-lifecycle.py "$(cat diagnostics/binary-path.txt)" \
+            --count 500 --parallel 4 --timeout 50 --sudo-gdb \
+            --continue-fast-failures --out diagnostics/repeated 2>&1 | tee diagnostics/repeated-summary.log
+      - name: Check original suite outcome
+        if: always() && steps.workspace.outcome == 'failure'
+        run: exit 1
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          # Each compat workspace has its own target/ — list them explicitly
-          # so the cache scopes correctly. Add a new line when introducing a
-          # new bin-v<TAG>/ workspace.
-          workspaces: |
-            crates/tests/raft-protocol-compat/bin-current
-            crates/tests/raft-protocol-compat/bin-v1.2.873
-            crates/tests/raft-protocol-compat/bin-v260205.4.0
-      - run: sudo apt-get update && sudo apt-get install -y mold protobuf-compiler
-      - run: make test-raft-protocol-compat
-
-  typos:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: crate-ci/typos@v1.46.0
+          name: meta-lifecycle-${{ matrix.source }}
+          path: diagnostics/
+          retention-days: 7

@@ -484,15 +484,26 @@ async fn test_meta_node_join_with_state() -> anyhow::Result<()> {
             .to_string(),
     ];
 
-    let n0 = MetaNode::<TokioRuntime>::start(&tc0.config).await?;
+    macro_rules! phase {
+        ($name:expr, $future:expr) => {{
+            eprintln!("LIFECYCLE BEGIN {}", $name);
+            let result = tokio::time::timeout(Duration::from_secs(120), $future)
+                .await
+                .unwrap_or_else(|_| panic!("LIFECYCLE TIMEOUT {}", $name));
+            eprintln!("LIFECYCLE END {}", $name);
+            result
+        }};
+    }
+
+    let n0 = phase!("start n0", MetaNode::<TokioRuntime>::start(&tc0.config))?;
     // Initial membership log, leader blank log, add node-0 log.
     let mut log_index = 3;
 
-    let res = n0.join_cluster(&tc0.config).await?;
+    let res = phase!("join n0", n0.join_cluster(&tc0.config))?;
     assert_eq!(Err("Did not join: --join is empty".to_string()), res);
 
-    let n1 = MetaNode::<TokioRuntime>::start(&tc1.config).await?;
-    let res = n1.join_cluster(&tc1.config).await?;
+    let n1 = phase!("start n1", MetaNode::<TokioRuntime>::start(&tc1.config))?;
+    let res = phase!("join n1", n1.join_cluster(&tc1.config))?;
     assert_eq!(Ok(()), res);
 
     // Two membership logs, one add-node log;
@@ -504,8 +515,11 @@ async fn test_meta_node_join_with_state() -> anyhow::Result<()> {
 
     info!("--- initialize store for node-2");
     {
-        let n2 = MetaNode::<TokioRuntime>::start(&tc2.config).await?;
-        n2.stop().await?;
+        let n2 = phase!(
+            "start empty n2",
+            MetaNode::<TokioRuntime>::start(&tc2.config)
+        )?;
+        phase!("stop empty n2", n2.stop())?;
     }
 
     // Wait a second to ensure server quits completely.
@@ -513,8 +527,11 @@ async fn test_meta_node_join_with_state() -> anyhow::Result<()> {
 
     info!("--- Allow to join node-2 with initialized store");
     {
-        let n2 = MetaNode::<TokioRuntime>::start(&tc2.config).await?;
-        let res = n2.join_cluster(&tc2.config).await?;
+        let n2 = phase!(
+            "restart initialized n2",
+            MetaNode::<TokioRuntime>::start(&tc2.config)
+        )?;
+        let res = phase!("join n2", n2.join_cluster(&tc2.config))?;
         assert_eq!(Ok(()), res);
 
         // Two membership logs, one add-node log;
@@ -528,7 +545,7 @@ async fn test_meta_node_join_with_state() -> anyhow::Result<()> {
             .applied_index(Some(log_index), "node-2 join cluster")
             .await?;
 
-        n2.stop().await?;
+        phase!("stop joined n2", n2.stop())?;
     }
 
     // Wait a second to ensure server quits completely.
@@ -536,18 +553,22 @@ async fn test_meta_node_join_with_state() -> anyhow::Result<()> {
 
     info!("--- Not allowed to join node-2 with store with membership");
     {
-        let n2 = MetaNode::<TokioRuntime>::start(&tc2.config).await?;
-        let res = n2.join_cluster(&tc2.config).await?;
+        let n2 = phase!(
+            "restart member n2",
+            MetaNode::<TokioRuntime>::start(&tc2.config)
+        )?;
+        let res = phase!("rejoin n2", n2.join_cluster(&tc2.config))?;
         assert_eq!(
             Err("Did not join: node 2 already in cluster".to_string()),
             res
         );
 
-        n2.stop().await?;
+        phase!("stop rejoined n2", n2.stop())?;
     }
 
-    n1.stop().await?;
-    n0.stop().await?;
+    phase!("stop n1", n1.stop())?;
+    phase!("stop n0", n0.stop())?;
+    eprintln!("LIFECYCLE BODY COMPLETE");
     Ok(())
 }
 
