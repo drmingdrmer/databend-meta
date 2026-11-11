@@ -9,18 +9,19 @@ edition = { workspace = true }
 
 [lib]
 doctest = false
-test = false
 
 [dependencies]
 anyhow = { workspace = true }
 databend-base = { workspace = true }
 databend-meta = { workspace = true }
+databend-meta-raft-config = { workspace = true }
 databend-meta-runtime-api = { workspace = true }
 databend-meta-types = { workspace = true }
 fastrace = { workspace = true }
 log = { workspace = true }
 maplit = { workspace = true }
 openraft = { workspace = true }
+socket2 = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }

@@ -16,8 +16,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use databend_meta::meta_node::meta_worker::MetaWorker;
-use databend_meta::meta_service::MetaNode;
 use databend_meta_runtime_api::RuntimeApi;
 use databend_meta_runtime_api::TokioRuntime;
 use databend_meta_types::Cmd;
@@ -49,11 +47,10 @@ async fn test_cluster_nodes() -> anyhow::Result<()> {
             .to_string(),
     ];
 
-    let _mn0 = MetaNode::<TokioRuntime>::start(&tc0.config).await?;
+    let _mn0 = tc0.start().await?;
 
     let runtime1 = TokioRuntime::new_testing("meta-io-rt-ut");
-    let meta_handle_1 =
-        MetaWorker::create_meta_worker(tc1.config.clone(), Arc::new(runtime1)).await?;
+    let meta_handle_1 = tc1.create_meta_worker(Arc::new(runtime1)).await?;
     let meta_handle_1 = Arc::new(meta_handle_1);
 
     let c = tc1.config.clone();
@@ -224,7 +221,7 @@ async fn test_handle_trigger_snapshot() -> anyhow::Result<()> {
     let tc = MetaSrvTestContext::<TokioRuntime>::new(0);
 
     let runtime = TokioRuntime::new_testing("meta-io-rt-ut");
-    let meta_handle = MetaWorker::create_meta_worker(tc.config.clone(), Arc::new(runtime)).await?;
+    let meta_handle = tc.create_meta_worker(Arc::new(runtime)).await?;
 
     // Trigger snapshot
     let result = meta_handle.handle_trigger_snapshot().await?;

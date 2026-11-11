@@ -172,6 +172,8 @@ impl<SP: SpawnApi> MetaNode<SP> {
             raft_config: Some(raft_config),
             sto: None,
             raft_service_endpoint: None,
+            raft_service_incoming: None,
+            raft_tls_incoming: None,
         }
     }
 

@@ -22,6 +22,7 @@
 //! - Fixture raft logs and their expected snapshot
 
 mod harness;
+mod port_reservation;
 mod service;
 mod snapshot_logs;
 

@@ -82,7 +82,7 @@ fn secret_node(id: NodeId, strict: bool) -> MetaSrvTestContext<TokioRuntime> {
 async fn boot(
     tc: &mut MetaSrvTestContext<TokioRuntime>,
 ) -> anyhow::Result<Arc<MetaNode<TokioRuntime>>> {
-    let mn = MetaNode::<TokioRuntime>::boot(&tc.config).await?;
+    let mn = tc.boot().await?;
     tc.meta_node = Some(mn.clone());
 
     mn.raft
@@ -105,7 +105,7 @@ async fn join(
         .raft_api_addr::<TokioRuntime>()
         .await?;
 
-    let mn = MetaNode::<TokioRuntime>::open(&tc.config.raft_config).await?;
+    let mn = tc.open().await?;
     tc.meta_node = Some(mn.clone());
 
     leader
