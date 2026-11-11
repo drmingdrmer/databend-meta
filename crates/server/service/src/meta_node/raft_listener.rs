@@ -17,12 +17,14 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyerror::AnyError;
 use databend_meta_runtime_api::SpawnApi;
 use databend_meta_types::Endpoint;
 use databend_meta_types::MetaNetworkError;
 use databend_meta_types::protobuf::raft_service_server::RaftServiceServer;
+use futures::StreamExt;
 use log::info;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::ServerTlsConfig;
@@ -34,6 +36,14 @@ use crate::meta_service::raft_service_impl::RaftServiceImpl;
 use crate::raft_secret::RaftSecretChecker;
 use crate::raft_transport::install_crypto_provider;
 use crate::raft_transport::server_tls_config;
+
+mod shutdown_io;
+
+use shutdown_io::ShutdownIo;
+
+// Allow active RPCs to drain, but do not let an unresponsive handshake keep
+// detached connection tasks (and their MetaNode references) alive indefinitely.
+const CONNECTION_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 /// A raft service that already holds its port but is not yet served.
 struct RaftListener {
@@ -186,6 +196,10 @@ async fn spawn_raft_listener<SP: SpawnApi>(meta_node: &Arc<MetaNode<SP>>, listen
     } = listener;
 
     let mut running_rx = meta_node.running_rx.clone();
+    let connection_shutdown = running_rx.clone();
+    let incoming = incoming.map(move |result| {
+        result.map(|io| ShutdownIo::new(io, connection_shutdown.clone(), CONNECTION_SHUTDOWN_GRACE))
+    });
     let node_id = meta_node.raft_store.id;
 
     info!("about to serve raft grpc on: {}://{}", scheme, socket_addr);
