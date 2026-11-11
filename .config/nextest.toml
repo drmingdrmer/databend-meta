@@ -1,0 +1,4 @@
+[profile.default]
+# SLOW alone is only a warning. Stop a hung process and print its captured logs.
+slow-timeout = { period = "60s", terminate-after = 3 }
+failure-output = "immediate-final"
