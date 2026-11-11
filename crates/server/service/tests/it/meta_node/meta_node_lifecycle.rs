@@ -118,6 +118,100 @@ async fn test_meta_node_graceful_shutdown() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// An unfinished peer must not keep Tonic's connection task or MetaNode alive.
+#[test(harness = meta_service_test_harness::<TokioRuntime, _, _>)]
+async fn test_meta_node_shutdown_with_incomplete_http2_handshake() -> anyhow::Result<()> {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+
+    for preface in [b"".as_slice(), b"PRI * HTTP/2.0\r\n".as_slice()] {
+        let tc = MetaSrvTestContext::<TokioRuntime>::new(0);
+        let mn = MetaNode::<TokioRuntime>::boot(&tc.config).await?;
+        let weak = Arc::downgrade(&mn);
+        let receivers = mn.running_tx.receiver_count();
+        let address = tc.config.raft_config.raft_api_listen_host_endpoint();
+        let mut peer = tokio::net::TcpStream::connect(address.to_string()).await?;
+        peer.write_all(preface).await?;
+
+        // Observe acceptance rather than sleeping and hoping the socket was served.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while mn.running_tx.receiver_count() <= receivers {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+
+        // Keep the peer open throughout stop(): closing it would hide the bug.
+        tokio::time::timeout(Duration::from_secs(15), mn.stop()).await??;
+        let mut bytes = Vec::new();
+        let closed =
+            tokio::time::timeout(Duration::from_secs(2), peer.read_to_end(&mut bytes)).await?;
+        if let Err(err) = closed {
+            assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+        }
+        drop(mn);
+        assert!(
+            weak.upgrade().is_none(),
+            "a detached connection still owns the node"
+        );
+    }
+    Ok(())
+}
+
+#[test(harness = meta_service_test_harness::<TokioRuntime, _, _>)]
+async fn test_meta_node_shutdown_with_incomplete_tls_handshake() -> anyhow::Result<()> {
+    use tokio::io::AsyncReadExt;
+
+    let mut tc = MetaSrvTestContext::<TokioRuntime>::new(0);
+    tc.config.raft_config.raft_tls_server_cert =
+        Some(crate::tests::tls_constants::TEST_SERVER_CERT.to_string());
+    tc.config.raft_config.raft_tls_server_key =
+        Some(crate::tests::tls_constants::TEST_SERVER_KEY.to_string());
+    let mn = MetaNode::<TokioRuntime>::boot(&tc.config).await?;
+    let weak = Arc::downgrade(&mn);
+    let receivers = mn.running_tx.receiver_count();
+    let address = tc
+        .config
+        .raft_config
+        .raft_tls_listen_host_endpoint()
+        .unwrap();
+    let mut peer = tokio::net::TcpStream::connect(address.to_string()).await?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while mn.running_tx.receiver_count() <= receivers {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
+    tokio::time::timeout(Duration::from_secs(15), mn.stop()).await??;
+    let mut bytes = Vec::new();
+    let closed = tokio::time::timeout(Duration::from_secs(2), peer.read_to_end(&mut bytes)).await?;
+    if let Err(err) = closed {
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionReset);
+    }
+    drop(mn);
+    assert!(
+        weak.upgrade().is_none(),
+        "a TLS connection still owns the node"
+    );
+    Ok(())
+}
+
+#[test(harness = meta_service_test_harness::<TokioRuntime, _, _>)]
+async fn test_meta_node_shutdown_with_live_http2_channel() -> anyhow::Result<()> {
+    let mut tc = MetaSrvTestContext::<TokioRuntime>::new(0);
+    let mn = MetaNode::<TokioRuntime>::boot(&tc.config).await?;
+    tc.meta_node = Some(mn.clone());
+    let mut client = tc.raft_client().await?;
+    client
+        .forward(ForwardRequest::new(0, ForwardRequestBody::Ping))
+        .await?;
+    // A healthy idle channel should complete graceful shutdown without waiting
+    // for the ten-second forced transport deadline.
+    tokio::time::timeout(Duration::from_secs(2), mn.stop()).await??;
+    drop(client);
+    Ok(())
+}
+
 #[test(harness = meta_service_test_harness::<TokioRuntime, _, _>)]
 #[fastrace::trace]
 async fn test_meta_node_join() -> anyhow::Result<()> {
